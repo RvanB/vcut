@@ -9,6 +9,10 @@ dependencies = [
     "jupyterlab>=4.4.2",
     "matplotlib>=3.10.3",
     "numpy>=2.2.5",
+    "opencv-python>=4.11.0.86",
     "pillow>=11.2.1",
     "scikit-image>=0.25.2",
+    "scipy-stubs>=1.15.3.0",
+    "svgpathtools>=1.7.0",
+    "tqdm>=4.67.1",
 ]
