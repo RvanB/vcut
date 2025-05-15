@@ -4,27 +4,23 @@ from skimage import measure
 from PIL import Image, ImageOps, ImageFilter
 import math
 import argparse
-import numba
 from numba import njit, prange
 import cv2
 
 
 def smooth_normals(img, d=20, sigmaColor=35):
     img_np = np.array(img)
-    smoothed = cv2.bilateralFilter(img_np, d, sigmaColor, 75)
+    smoothed = cv2.bilateralFilter(img_np, d, sigmaColor, 50)
     return Image.fromarray(smoothed)
 
 
 def upscale(img, upscale_factor):
-    # Interpolate to higher resolution (bicubic)
-    # img_np = np.array(img).astype(np.float32) / 255.0
     img_np = np.array(img)
     img_np = zoom(img_np, upscale_factor, order=3)
-    # img_np = (img_np * 255).astype(np.uint8)
     return Image.fromarray(img_np)
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-i", "--image-file", help="Path to the input image", required=True
@@ -47,42 +43,28 @@ def main():
         help="How far forward and backward to look on contour for tangent estimation",
     )
     args = parser.parse_args()
-
-    # Load a black-on-white image of the text
-    img = Image.open(args.image_file).convert("L")
-
-    if args.upscale_factor:
-        print("Upscaling image")
-        img = upscale(img, args.upscale_factor)
-
-    img = ImageOps.invert(img)
-
-    # print("Upscaling and masking")
-    # mask = upscale_and_mask(img, args.upscale_factor, args.threshold)
-
-    mask = np.array(img) > args.threshold
-
-    print("Computing normals")
-    normal_map = compute_contour_based_normals(np.array(mask), strength=1.0)
-
-    print("Smoothing normals")
-    normal_map = smooth_normals(normal_map)
-
-    print("Saving output")
-    normal_map.save(args.output_file)
+    return args
 
 
 @njit
-def normalize(vx, vy):
-    norm = math.sqrt(vx * vx + vy * vy) + 1e-8
-    return vx / norm, vy / norm
+def calculate_angle(v0, v1):
+    dot = np.dot(v0, v1)
+    return math.acos(dot)
+
+
+@njit
+def normalize(v):
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        return v
+    return v / norm
 
 
 @njit(parallel=True)
 def compute_normals(
     mask,
-    contour_x,
-    contour_y,
+    contourX,
+    contourY,
     contour_id_map,
     contour_index_map,
     contours_flat,
@@ -97,62 +79,71 @@ def compute_normals(
             if not mask[y, x]:
                 continue
 
-            cy = contour_y[y, x]
-            cx = contour_x[y, x]
-            c_id = contour_id_map[cy, cx]
-            c_idx = contour_index_map[cy, cx]
+            point = np.array([y, x]).astype(np.float32)
+
+            closest_contour_point = np.array([contourY[y, x], contourX[y, x]])
+
+            # ID of closest contour pixel
+            c_id = contour_id_map[closest_contour_point[0], closest_contour_point[1]]
+            # index of pixel in the contour
+            c_idx = contour_index_map[
+                closest_contour_point[0], closest_contour_point[1]
+            ]
 
             if c_id < 0 or c_idx < 0:
                 continue
 
+            # Get the entire contour
             start = contour_start_idx[c_id]
             end = contour_start_idx[c_id + 1]
             contour = contours_flat[start:end]
             n = end - start
 
+            contour_to_point = normalize(point - closest_contour_point)
+
+            # Indices in contour before and after closest point
             i0 = max(c_idx - tangent_sample_size, 0)
             i1 = min(c_idx + tangent_sample_size, n - 1)
 
-            y0, x0 = contour[i0]
-            y2, x2 = contour[i1]
-
-            # Vector from contour to pixel
-            vx, vy = x - cx, y - cy
-            v0x, v0y = normalize(vx, vy)
+            # Get before and after point locations
+            before_point = np.array(list(contour[i0]))
+            after_point = np.array(list(contour[i1]))
 
             # Neighbor vectors
-            v1x, v1y = normalize(x0 - cx, y0 - cy)
-            v2x, v2y = normalize(x2 - cx, y2 - cy)
+            before_vector = normalize(before_point - closest_contour_point)
+            after_vector = normalize(after_point - closest_contour_point)
+            # bvx, bvy = normalize(bvx - cx, bvy - cy)
+            # v2x, v2y = normalize(x2 - cx, y2 - cy)
 
-            dot1 = max(-1.0, min(v0x * v1x + v0y * v1y, 1.0))
-            dot2 = max(-1.0, min(v0x * v2x + v0y * v2y, 1.0))
-            a1 = math.acos(dot1)
-            a2 = math.acos(dot2)
+            angle_to_before = calculate_angle(contour_to_point, before_vector)
+            angle_to_after = calculate_angle(contour_to_point, after_vector)
 
-            # Tangents
-            t1x, t1y = normalize(cx - x0, cy - y0)
-            t2x, t2y = normalize(x2 - cx, y2 - cy)
-
-            # Rotate clockwise to get normals
-            n1x, n1y = t1y, -t1x
-            n2x, n2y = t2y, -t2x
-
-            if a1 < a2:
-                nx2d[y, x], ny2d[y, x] = n1x, n1y
+            if angle_to_before < angle_to_after:
+                tangent = normalize(closest_contour_point - before_point)
             else:
-                nx2d[y, x], ny2d[y, x] = n2x, n2y
+                tangent = normalize(after_point - closest_contour_point)
+
+            nx2d[y, x], ny2d[y, x] = -tangent[1], tangent[0]
 
 
 def compute_contour_based_normals(mask, strength=1.0):
     h, w = mask.shape
 
-    # --- Extract contours ---
     contours = measure.find_contours(mask, 0.01)
+
+    # Contour bitmap
     contour_img = np.zeros((h, w), dtype=bool)
+
+    # index of pixel in contour (not globally unique)
     contour_index_map = -np.ones((h, w), dtype=np.int32)
+
+    # IDs of contour (not pixels)
     contour_id_map = -np.ones((h, w), dtype=np.int32)
 
+    # List of all points, across contours
     contour_flat_list = []
+
+    # Indices of breaks between contours
     contour_start_idx = [0]
 
     for contour_id, contour in enumerate(contours):
@@ -168,32 +159,32 @@ def compute_contour_based_normals(mask, strength=1.0):
     contours_flat = np.array(contour_flat_list, dtype=np.float32)
     contour_start_idx = np.array(contour_start_idx, dtype=np.int32)
 
-    # --- Distance transform ---
+    # Calculate distances to contour throughout image
     _, indices = distance_transform_edt(~contour_img, return_indices=True)
-    contour_y, contour_x = indices
+    contourY, contourX = indices
 
-    nx2d = np.zeros((h, w), dtype=np.float32)
-    ny2d = np.zeros((h, w), dtype=np.float32)
+    normalX = np.zeros((h, w), dtype=np.float32)
+    normalY = np.zeros((h, w), dtype=np.float32)
 
+    # Populate normalX and normalY
     compute_normals(
         mask,
-        contour_x,
-        contour_y,
+        contourX,
+        contourY,
         contour_id_map,
         contour_index_map,
         contours_flat,
         contour_start_idx,
-        nx2d,
-        ny2d,
+        normalX,
+        normalY,
         8,
     )
 
-    # --- Construct 3D normal map ---
-    nz = np.full_like(nx2d, 1.0 / strength)
-    length = np.sqrt(nx2d**2 + ny2d**2 + nz**2)
-    nx = nx2d / length
-    ny = ny2d / length
-    nz = nz / length
+    normalZ = np.full_like(normalX, 1.0 / strength)
+    length = np.sqrt(normalX**2 + normalY**2 + normalZ**2)
+    nx = normalX / length
+    ny = normalY / length
+    nz = normalZ / length
 
     normal_rgb = np.zeros((h, w, 3), dtype=np.uint8)
     normal_rgb[..., 0] = ((nx + 1) * 127.5).astype(np.uint8)
@@ -202,6 +193,30 @@ def compute_contour_based_normals(mask, strength=1.0):
     normal_rgb[~mask] = [128, 128, 255]
 
     return Image.fromarray(normal_rgb, mode="RGB")
+
+
+def main():
+    args = parse_args()
+
+    # Load a black-on-white image of the text
+    img = Image.open(args.image_file).convert("L")
+
+    if args.upscale_factor:
+        print("Upscaling image")
+        img = upscale(img, args.upscale_factor)
+
+    img = ImageOps.invert(img)
+
+    mask = np.array(img) > args.threshold
+
+    print("Computing normals")
+    normal_map = compute_contour_based_normals(np.array(mask), strength=1.0)
+
+    print("Smoothing normals")
+    normal_map = smooth_normals(normal_map)
+
+    print("Saving output")
+    normal_map.save(args.output_file)
 
 
 if __name__ == "__main__":
