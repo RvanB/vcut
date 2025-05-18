@@ -6,7 +6,7 @@ import math
 import argparse
 from numba import njit, prange
 import cv2
-
+import os
 
 def smooth_normals(img, d=20, sigmaColor=25):
     img_np = np.array(img)
@@ -35,7 +35,7 @@ def normalize(v):
 
 
 @njit
-def estimate_normal(
+def estimate_tangent(
     before_contour_point, closest_contour_point, after_contour_point, point
 ):
     # Vectors
@@ -51,12 +51,11 @@ def estimate_normal(
     else:
         tangent = normalize(after_contour_point - closest_contour_point)
 
-    normal = -tangent[1], tangent[0]
-    return normal
+    return tangent
 
 
 @njit(parallel=True)
-def compute_normals(
+def process(
         *,
         mask,
         contourX,
@@ -67,6 +66,7 @@ def compute_normals(
         contour_start_idx,
         normalX,
         normalY,
+        displacement,
         tangent_sample_size
 ):
     h, w = mask.shape
@@ -103,14 +103,22 @@ def compute_normals(
             before_contour_point = np.array(list(contour[i0]))
             after_contour_point = np.array(list(contour[i1]))
 
-            normal = estimate_normal(
+            tangent = estimate_tangent(
                 before_contour_point, closest_contour_point, after_contour_point, point
             )
-
+            normal = -tangent[1], tangent[0]
             normalX[y, x], normalY[y, x] = normal
 
+            # Project onto tangent
+            a = point - closest_contour_point
+            proj = np.dot(a, tangent) * tangent + closest_contour_point
+            
+            distance = np.linalg.norm(point - proj)
+            displacement[y, x] = distance
+            
 
-def compute_contour_based_normals(mask, tangent_sample_size, strength):
+
+def generate_textures(mask, tangent_sample_size, strength):
     h, w = mask.shape
 
     contours = measure.find_contours(mask, 0.01)
@@ -150,8 +158,10 @@ def compute_contour_based_normals(mask, tangent_sample_size, strength):
     normalX = np.zeros((h, w), dtype=np.float32)
     normalY = np.zeros((h, w), dtype=np.float32)
 
+    displacement = np.zeros((h, w), dtype=np.float32)
+
     # Populate normalX and normalY
-    compute_normals(
+    process(
         mask=mask,
         contourX=contourX,
         contourY=contourY,
@@ -161,8 +171,16 @@ def compute_contour_based_normals(mask, tangent_sample_size, strength):
         contour_start_idx=contour_start_idx,
         normalX=normalX,
         normalY=normalY,
+        displacement=displacement,
         tangent_sample_size=tangent_sample_size
     )
+
+    # Post-process displacement image
+    displacement = -displacement
+    displacement[~mask] = 0
+    displacement -= np.min(displacement)
+    displacement /= np.max(displacement)
+    displacement = (displacement * 255).astype(np.uint8)
 
     normalZ = np.full_like(normalX, 1.0 / strength)
     length = np.sqrt(normalX**2 + normalY**2 + normalZ**2)
@@ -175,17 +193,14 @@ def compute_contour_based_normals(mask, tangent_sample_size, strength):
     normal_rgb[..., 1] = ((ny + 1) * 127.5).astype(np.uint8)
     normal_rgb[..., 2] = ((nz + 1) * 127.5).astype(np.uint8)
     normal_rgb[~mask] = [128, 128, 255]
-
-    return Image.fromarray(normal_rgb, mode="RGB")
+    
+    return Image.fromarray(normal_rgb, mode="RGB"), Image.fromarray(displacement)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-i", "--image-file", help="Path to the input image", required=True
-    )
-    parser.add_argument(
-        "-o", "--output-file", help="Path to the output normal map", required=True
     )
     parser.add_argument(
         "-u",
@@ -228,17 +243,24 @@ def main():
 
     mask = np.array(img) > args.threshold
 
-    print("Computing normals")
-    normal_map = compute_contour_based_normals(
+    print("Computing textures")
+    normal_map, displacement_map = generate_textures(
         mask=np.array(mask),
         tangent_sample_size=args.tangent_sample_size,
         strength=args.strength)
 
     print("Smoothing normals")
+
+    input_basename, ext = os.path.splitext(args.image_file)
+
+    normal_outpath = f"{input_basename}_normal{ext}"
+    displacement_outpath = f"{input_basename}_displacement{ext}"
+    
     normal_map = smooth_normals(normal_map)
 
-    print("Saving output")
-    normal_map.save(args.output_file)
+    print("Saving outputs")
+    normal_map.save(normal_outpath)
+    displacement_map.save(displacement_outpath)
 
 
 if __name__ == "__main__":
