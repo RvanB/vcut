@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.ndimage import distance_transform_edt, zoom
+from scipy.ndimage import distance_transform_edt, zoom, binary_closing
 from skimage import measure
 from PIL import Image, ImageOps, ImageFilter
 import math
@@ -8,7 +8,7 @@ from numba import njit, prange
 import cv2
 import os
 
-def smooth_normals(img, d=20, sigmaColor=25):
+def smooth_normals(img, d=35, sigmaColor=35):
     img_np = np.array(img)
     smoothed = cv2.bilateralFilter(img_np, d, sigmaColor, 50)
     return Image.fromarray(smoothed)
@@ -241,7 +241,9 @@ def main():
 
     img = ImageOps.invert(img)
 
-    mask = np.array(img) > args.threshold
+    mask = (np.array(img) > args.threshold).astype(np.uint8)
+
+    mask = binary_closing(mask, iterations=1)
 
     print("Computing textures")
     normal_map, displacement_map = generate_textures(
@@ -253,8 +255,8 @@ def main():
 
     input_basename, ext = os.path.splitext(args.image_file)
 
-    normal_outpath = f"{input_basename}_normal{ext}"
-    displacement_outpath = f"{input_basename}_displacement{ext}"
+    normal_outpath = f"{input_basename}_normal.png"
+    displacement_outpath = f"{input_basename}_displacement.png"
     
     normal_map = smooth_normals(normal_map)
 
