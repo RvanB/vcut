@@ -1,0 +1,7 @@
+* vcut
+
+Carve normal and displacement maps the way a chisel would, from only raster images.
+
+[[./vcut.png]]
+[[./vcut_normal.png]]
+[[./vcut_displacement.png]]
